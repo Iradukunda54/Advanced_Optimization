@@ -1,0 +1,50 @@
+type Query {
+    users: [UserDTO]
+    user(id: ID!): UserDTO
+    posts: [PostDTO]
+    post(id: ID!): PostDTO
+    searchPosts(keyword: String!): [PostDTO]
+}
+
+type Mutation {
+    # Authentication
+    login(username: String!, password: String!): AuthResponse
+    register(username: String!, email: String!, password: String!, role: String!): String
+    logout: String
+
+    # Data Operations
+    createUser(username: String!, email: String!, role: String!): UserDTO
+    createPost(title: String!, content: String!, authorId: ID!): PostDTO
+    addComment(content: String!, postId: ID!, authorId: ID!): CommentDTO
+}
+
+type AuthResponse {
+    token: String
+    id: ID
+    username: String
+    email: String
+    roles: [String]
+}
+
+type UserDTO {
+    id: ID
+    username: String
+    email: String
+    role: String
+}
+
+type PostDTO {
+    id: ID
+    title: String
+    content: String
+    authorName: String
+    createdAt: String
+    views: Int
+}
+
+type CommentDTO {
+    id: ID
+    content: String
+    authorName: String
+    createdAt: String
+}
