@@ -7,14 +7,16 @@ import com.blog.model.User;
 import com.blog.repository.PostRepository;
 import com.blog.repository.TagRepository;
 import com.blog.repository.UserRepository;
-import com.blog.service.PostService;
+import com.blog.service.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.Page;
-import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+
 import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -22,14 +24,27 @@ import java.util.stream.Collectors;
 @Service
 public class PostServiceImpl implements PostService {
 
+    private static final Logger logger = LoggerFactory.getLogger(PostServiceImpl.class);
+
     private final PostRepository postRepository;
     private final UserRepository userRepository;
     private final TagRepository tagRepository;
+    private final NotificationService notificationService;
+    private final ConcurrentViewCounter viewCounter;
+    private final TrendingPostCache trendingCache;
+    private final SearchOptimizationService searchOptimizationService;
 
-    public PostServiceImpl(PostRepository postRepository, UserRepository userRepository, TagRepository tagRepository) {
+    public PostServiceImpl(PostRepository postRepository, UserRepository userRepository, 
+                           TagRepository tagRepository, NotificationService notificationService,
+                           ConcurrentViewCounter viewCounter, TrendingPostCache trendingCache,
+                           SearchOptimizationService searchOptimizationService) {
         this.postRepository = postRepository;
         this.userRepository = userRepository;
         this.tagRepository = tagRepository;
+        this.notificationService = notificationService;
+        this.viewCounter = viewCounter;
+        this.trendingCache = trendingCache;
+        this.searchOptimizationService = searchOptimizationService;
     }
 
     @Override
@@ -49,16 +64,21 @@ public class PostServiceImpl implements PostService {
         }
         
         Post savedPost = postRepository.save(post);
+        
+        // ASYNC: Dispatch notification without blocking the main thread
+        notificationService.notifyOnNewPost(savedPost);
+        
         return mapToDTO(savedPost);
     }
 
     @Override
     @Cacheable(value = "posts", key = "#id")
     public PostDTO getPostById(Long id) {
-        System.out.println("db");
         Post post = postRepository.findById(id).orElseThrow(() -> new RuntimeException("Post not found"));
-        post.setViews(post.getViews() + 1); // Increment views
-        postRepository.save(post);
+        
+        // CONCURRENCY: Use thread-safe view counter instead of direct DB update
+        viewCounter.incrementView(id);
+        
         return mapToDTO(post);
     }
 
@@ -73,20 +93,35 @@ public class PostServiceImpl implements PostService {
     }
 
     @Override
-    @Cacheable(value = "popularPosts")
     public List<PostDTO> getPopularPosts(int limit) {
-        return postRepository.findTopPopularPosts(PageRequest.of(0, limit))
+        // DSA: Use trending cache (PriorityQueue based) for fast retrieval
+        List<PostDTO> trending = trendingCache.getTrendingPosts(limit);
+        if (!trending.isEmpty()) {
+            return trending;
+        }
+        
+        // Fallback to DB if cache is empty
+        return postRepository.findTopPopularPosts(org.springframework.data.domain.PageRequest.of(0, limit))
                 .stream().map(this::mapToDTO).collect(Collectors.toList());
     }
 
     @Override
     public List<PostDTO> searchPosts(String keyword) {
-        return postRepository.searchByKeyword(keyword).stream().map(this::mapToDTO).collect(Collectors.toList());
+        // ALGORITHMIC OPTIMIZATION: Check search cache first
+        List<PostDTO> cached = searchOptimizationService.getCachedResults(keyword);
+        if (cached != null) return cached;
+        
+        List<PostDTO> results = postRepository.searchByKeyword(keyword).stream()
+                .map(this::mapToDTO)
+                .collect(Collectors.toList());
+        
+        searchOptimizationService.cacheResults(keyword, results);
+        return results;
     }
 
     @Override
     @Transactional
-    @CacheEvict(value = {"posts", "popularPosts"}, allEntries = true)
+    @CacheEvict(value = {"posts", "popularPosts", "searchResults"}, allEntries = true)
     public PostDTO updatePost(Long id, PostDTO postDTO) {
         Post post = postRepository.findById(id).orElseThrow(() -> new RuntimeException("Post not found"));
         post.setTitle(postDTO.getTitle());
@@ -97,7 +132,7 @@ public class PostServiceImpl implements PostService {
 
     @Override
     @Transactional
-    @CacheEvict(value = {"posts", "popularPosts"}, allEntries = true)
+    @CacheEvict(value = {"posts", "popularPosts", "searchResults"}, allEntries = true)
     public void deletePost(Long id) {
         postRepository.deleteById(id);
     }
@@ -110,7 +145,11 @@ public class PostServiceImpl implements PostService {
         dto.setAuthorId(post.getAuthor().getId());
         dto.setAuthorName(post.getAuthor().getUsername());
         dto.setCreatedAt(post.getCreatedAt());
-        dto.setViews(post.getViews());
+        
+        // Combine DB views with current in-memory view buffer
+        int currentViews = post.getViews() + viewCounter.getViewCount(post.getId());
+        dto.setViews(currentViews);
+        
         if (post.getTags() != null) {
             dto.setTags(post.getTags().stream().map(Tag::getName).collect(Collectors.toSet()));
         }
